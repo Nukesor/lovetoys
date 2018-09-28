@@ -105,17 +105,17 @@ function Engine:removeEntity(entity, removeChildren, newParent)
     end
 end
 
-function Engine:addSystem(system, type)
+function Engine:addSystem(system, systemType)
     local name = system.class.name
 
     -- Check if the specified type is correct
-    if type ~= nil and type ~= "draw" and type ~= "update" then
-        lovetoys.debug("Engine: Trying to add System " .. name .. "with invalid type " .. type .. ". Aborting")
+    if systemType ~= nil and systemType ~= "draw" and systemType ~= "update" then
+        lovetoys.debug("Engine: Trying to add System " .. name .. "with invalid type " .. systemType .. ". Aborting")
         return
     end
 
     -- Check if a type should be specified
-    if system.draw and system.update and not type then
+    if system.draw and system.update and not systemType then
         lovetoys.debug("Engine: Trying to add System " .. name .. ", which has an update and a draw function, without specifying type. Aborting")
         return
     end
@@ -124,6 +124,30 @@ function Engine:addSystem(system, type)
     if self.systemRegistry[name] and self.systemRegistry[name] ~= system then
         lovetoys.debug("Engine: Trying to add two different instances of the same system. Aborting.")
         return
+    end
+
+    -- Assert that system:excludes returns the same structure as system:requires or an empty list.
+    requires = system:requires()
+    excludes = system:excludes()
+    firstElement = lovetoys.util.firstElement
+    one_is_table = type(firstElement(requires)) == "table" or type(firstElement(excludes)) == "table"
+    both_are_table = type(firstElement(requires)) == "table" and type(firstElement(excludes)) == "table"
+    if one_is_table then
+        -- Check if the system has excludes.
+        if lovetoys.util.listLength(excludes) > 0 then
+            -- One of both, `excludes` or `requires`, returns a list, the other doesn't.
+            if not both_are_table then
+                lovetoys.debug("System: " .. name .. " has different list structures for :requires() and :excludes().")
+                return
+            end
+            -- Check if the keys for both categories match. We only need to check from requires to excludes, as this is what matters.
+            for category, _ in requires do
+                if not exclude[category] then
+                    lovetoys.debug("System: " .. name .. " has different category names for :requires() and :excludes().")
+                    return
+                end
+            end
+        end
     end
 
     -- Adding System to engine system reference table
@@ -138,7 +162,7 @@ function Engine:addSystem(system, type)
     end
 
     -- Adding System to draw table
-    if system.draw and (not type or type == "draw") then
+    if system.draw and (not systemType or systemType == "draw") then
         for _, registeredSystem in pairs(self.systems["draw"]) do
             if registeredSystem.class.name == name then
                 lovetoys.debug("Engine: System " .. name .. " already exists. Aborting")
@@ -147,7 +171,7 @@ function Engine:addSystem(system, type)
         end
         table.insert(self.systems["draw"], system)
     -- Adding System to update table
-    elseif system.update and (not type or type == "update") then
+    elseif system.update and (not systemType or systemType == "update") then
         for _, registeredSystem in pairs(self.systems["update"]) do
             if registeredSystem.class.name == name then
                 lovetoys.debug("Engine: System " .. name .. " already exists. Aborting")
@@ -164,8 +188,28 @@ function Engine:addSystem(system, type)
     return system
 end
 
+-- Register a System to the Engine. This is done once or twice for each System,
+-- depending if it has either a draw or update method or both of them.
+
+-- There are a few things happening in this function:
+--
+-- First the system is added to the global System registry
+-- Next we add the System to several requirement lists:
+-- `singleRequirements`: This is a list where Component names are mapped to lists of Systems.
+--      Each system exists only *once* or *max the number of multiple requirement categories* in this collection.
+--      During registration we take the first Component name of every requirement list
+--      and add the system to this specific list e.g.:
+--          table.insert(singleRequirement['first'], system)
+--      This list is really useful to check requirements only once per system during entity addition instead of n times.
+-- `allRequirements`: This is a list where Component names are mapped to lists of systems.
+--      In here we can find every System that requires a specific Component.
+--      We need this to notify Systems in case an Entity has Components added or removed.
+--
 function Engine:registerSystem(system)
+    -- Shortcut variables
     local name = system.class.name
+    local firstElement = lovetoys.util.firstElement
+
     self.systemRegistry[name] = system
     -- case: system:requires() returns a table of strings
     if system:requires()[1] and type(system:requires()[1]) == "string" then
@@ -182,7 +226,7 @@ function Engine:registerSystem(system)
     end
 
     -- case: system:requires() returns a table of tables which contain strings
-    if lovetoys.util.firstElement(system:requires()) and type(lovetoys.util.firstElement(system:requires())) == "table" then
+    if firstElement(system:requires()) and type(firstElement(system:requires())) == "table" then
         for index, componentList in pairs(system:requires()) do
             -- Registering at singleRequirements
             local component = componentList[1]
@@ -289,7 +333,7 @@ function Engine:getRootEntity()
     end
 end
 
--- Returns an Entitylist for a specific component. If the Entitylist doesn't exist yet it'll be created and returned.
+-- Returns an list with all Entity owning a specific component. If the Entity list doesn't exist yet it'll be created and returned.
 function Engine:getEntitiesWithComponent(component)
     if not self.entityLists[component] then self.entityLists[component] = {} end
     return self.entityLists[component]
@@ -299,37 +343,80 @@ end
 function Engine:getEntityCount(component)
     local count = 0
     if self.entityLists[component] then
-        for _, system in pairs(self.entityLists[component]) do
-            count = count + 1
-        end
-    end      
-    return count    
+        count = lovetoys.util.listLength(self.entityLists[component])
+    end
+    return count
 end
 
+-- This function check, if an Entity satisfies all requirements of a specific system
 function Engine:checkRequirements(entity, system) -- luacheck: ignore self
-    local meetsrequirements = true
+    -- Do a quick lookup, if the Entity already is in the system.
+    -- This is a log(n) lookup and should prevent multiple n*log(m)
+    -- runs of the same Entity on the same system.
+    --Overall performance should be better
+    if system.targets[entity.id] then return end
+
+
+    local meetsRequirements = true
     local category = nil
-    for index, req in pairs(system:requires()) do
-        if type(req) == "string" then
-            if not entity.components[req] then
-                meetsrequirements = false
-                break
-            end
+
+    -- Variables to allow checking of the exclude logic with multiple requirement categories
+    -- The blacklist decides if the entity is excluded for a specific category.
+    -- The has_exclusions variable is needed to check if there are any excludes at all.
+    --     If that's the case we can skip the blacklist lookup.
+    local excluded_table_blacklist = {}
+    local has_exclusions = lovetoys.util.listLength(system:excludes())
+
+    -- Check for excludes
+    for index, exclude in pairs(system:excludes()) do
+        -- Normal case: system:excludes() returns a list of Component name strings.
+        if type(exclude) == "string" then
+            -- The Entity contains an excluded component. Early return.
+            if entity.components[exclude] then return end
+
+        -- The requirements of the System are split into multiple
+        -- target categories. The system:excludes function needs to return
+        -- a list with the same structure as system:requires.
         elseif type(req) == "table" then
-            meetsrequirements = true
-            for _, req2 in pairs(req) do
-                if not entity.components[req2] then
-                    meetsrequirements = false
+            for _, nested_exclude in pairs(exclude) do
+                if not entity.components[nested_exclude] then
+                    excluded_table_blacklist[index] = true
                     break
                 end
             end
-            if meetsrequirements == true then
+            excluded_table_blacklist[index] = false
+        end
+    end
+
+
+    -- This is the actual requirement check
+    for index, req in pairs(system:requires()) do
+        -- Normal case: system:requires() returns a list of Component name strings.
+        if type(req) == "string" then
+            -- Requirement is not fulfilled, perform early return
+            if not entity.components[req] then return end
+
+        -- The requirements of the System are split into multiple
+        -- target categories. Each category is handled separately.
+        elseif type(req) == "table" then
+            -- Check if the entity is blacklisted for this category
+            if has_exclusions > 0 and excluded_table_blacklist[index] then break end
+
+            -- Check if the requirements are satisfied for this category
+            meetsRequirements = true
+            for _, req2 in pairs(req) do
+                if not entity.components[req2] then
+                    meetsRequirements = false
+                    break
+                end
+            end
+            if meetsRequirements == true then
                 category = index
                 system:addEntity(entity, category)
             end
         end
     end
-    if meetsrequirements == true and category == nil then
+    if meetsRequirements == true and category == nil then
         system:addEntity(entity)
     end
 end
